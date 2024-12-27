@@ -191,7 +191,7 @@ class DiTBlock(nn.Module):
         ############################### Reuse Attention ###############################
         if self.attn_th is not None and (stepdiff < self.attn_th):
             attn_x = self.attn_out
-            # print("reuse")
+            print("reuse")
         else: 
             attn_x = self.attn(norm_x)
 
@@ -228,7 +228,7 @@ class DiTBlock(nn.Module):
         ############################### Reuse Attention ###############################
         if self.ffn_th is not None and (stepdiff < self.ffn_th):
             mlp_x = self.ffn_out
-            # print("reuse")
+            print("reuse")
         else: 
             mlp_x = self.mlp(norm_x)
 
