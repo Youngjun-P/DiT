@@ -115,10 +115,130 @@ class DiTBlock(nn.Module):
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
         )
 
-    def forward(self, x, c):
+        self.attn_input = None
+        self.attn_th = None
+        self.attn_diff = None
+        self.attn_sign = None
+        self.attn_out = None
+
+        self.ffn_input = None
+        self.ffn_th = None
+        self.ffn_diff = None
+        self.ffn_sign = None
+        self.ffn_out = None
+        
+        self.T = None
+
+    def extract_exponent_bits(self, tensor):
+        int32_tensor = tensor.view(torch.int32)
+        mask_30_29 = 0x60000000
+        mask_30_28 = 0x70000000
+        mask_29_26 = 0x3c000000
+        mask_25_22 = 0x03c00000
+
+        indicaotr_bits = (int32_tensor & mask_30_29) >> 29
+
+        result = torch.where(
+            indicaotr_bits == 0b00,
+            (int32_tensor & mask_30_28) >> 28,  
+            torch.where(
+                indicaotr_bits == 0b01,
+                (int32_tensor & mask_29_26) >> 26,  
+                torch.where(
+                    indicaotr_bits == 0b10, 
+                    (int32_tensor & mask_25_22) >> 22 | 0b0010,  
+                    0b0111  # otherwise
+                )
+            )
+        )
+        return result
+    
+
+    def forward(self, x, c, step):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
-        x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
-        x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        
+        if self.T is None: self.T = step
+        # 1. linear scheduling alpha
+        alpha = (self.T-step)/self.T
+        # 2. cosine scheduling alpha
+        # alpha = 0.5*(1-torch.cos(torch.pi*(self.T-step)/self.T))
+
+        # MSA
+        norm_x = modulate(self.norm1(x), shift_msa, scale_msa)
+        ############################## Input Compression ##############################
+        compressed_input = self.extract_exponent_bits(norm_x)
+        if self.attn_input is not None:
+            mask = (self.attn_input != compressed_input)
+            stepdiff = mask.sum()
+            if self.attn_th is None: self.attn_th = stepdiff
+            self.attn_input = compressed_input
+        else:
+            stepdiff = None
+            self.attn_input = compressed_input
+        # Dynamic Threshold Searching (DTS)
+        if stepdiff is not None:
+            if self.attn_diff is None:
+                self.attn_diff = stepdiff
+            else:
+                if self.attn_sign is None:
+                    self.attn_sign = stepdiff < self.attn_diff
+                elif self.attn_sign and stepdiff > self.attn_diff:
+                    self.attn_th = self.attn_diff + torch.trunc((stepdiff-self.attn_diff)*alpha)
+                self.attn_sign = stepdiff < self.attn_diff
+                self.attn_diff = stepdiff
+        ###############################################################################
+        
+        ############################### Reuse Attention ###############################
+        if self.attn_th is not None and (stepdiff < self.attn_th):
+            attn_x = self.attn_out
+            # print("reuse")
+        else: 
+            attn_x = self.attn(norm_x)
+
+        self.attn_out = attn_x
+        ###############################################################################
+        attn_x = gate_msa.unsqueeze(1) * attn_x
+        x = x + attn_x
+
+        # MLP
+        norm_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
+        ############################## Input Compression ##############################
+        compressed_input = self.extract_exponent_bits(norm_x)
+        if self.ffn_input is not None:
+            mask = (self.ffn_input != compressed_input)
+            stepdiff = mask.sum()
+            if self.ffn_th is None: self.ffn_th = stepdiff
+            self.ffn_input = compressed_input
+        else:
+            stepdiff = None
+            self.ffn_input = compressed_input
+        # Dynamic Threshold Searching (DTS)
+        if stepdiff is not None:
+            if self.ffn_diff is None:
+                self.ffn_diff = stepdiff
+            else:
+                if self.ffn_sign is None:
+                    self.ffn_sign = stepdiff < self.ffn_diff
+                elif self.ffn_sign and stepdiff > self.ffn_diff:
+                    self.ffn_th = self.ffn_diff + torch.trunc((stepdiff-self.ffn_diff)*alpha)
+                self.ffn_sign = stepdiff < self.ffn_diff
+                self.ffn_diff = stepdiff
+        ###############################################################################
+        
+        ############################### Reuse Attention ###############################
+        if self.ffn_th is not None and (stepdiff < self.ffn_th):
+            mlp_x = self.ffn_out
+            # print("reuse")
+        else: 
+            mlp_x = self.mlp(norm_x)
+
+        self.ffn_out = mlp_x
+        ###############################################################################
+        mlp_x = gate_mlp.unsqueeze(1) * mlp_x
+        x = x + mlp_x
+        
+        # x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+        # x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
 
 
@@ -237,12 +357,13 @@ class DiT(nn.Module):
         t: (N,) tensor of diffusion timesteps
         y: (N,) tensor of class labels
         """
+        step = t[0]
         x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
         t = self.t_embedder(t)                   # (N, D)
         y = self.y_embedder(y, self.training)    # (N, D)
         c = t + y                                # (N, D)
         for block in self.blocks:
-            x = block(x, c)                      # (N, T, D)
+            x = block(x, c, step)                      # (N, T, D)
         x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
         x = self.unpatchify(x)                   # (N, out_channels, H, W)
         return x
